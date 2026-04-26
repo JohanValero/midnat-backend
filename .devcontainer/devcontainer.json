@@ -9,9 +9,11 @@
       "settings": {
         "python.defaultInterpreterPath": "/usr/local/bin/python",
         "editor.formatOnSave": true,
-        "editor.defaultFormatter": "ms-python.black-formatter"
+        "editor.defaultFormatter": "ms-python.black-formatter",
+        "sqlite.sqlite3": "/usr/bin/sqlite3"
       },
       "extensions": [
+        "alexcvzz.vscode-sqlite",
         "ms-python.python",
         "ms-python.vscode-pylance",
         "ms-python.black-formatter"
