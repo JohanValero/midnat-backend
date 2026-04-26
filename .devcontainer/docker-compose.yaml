@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  backend:
+    image: mcr.microsoft.com/devcontainers/python:3.13
+    volumes:
+      - ..:/workspace:cached
+    command: sleep infinity
+    networks:
+      - midnat-dev-network
+networks:
+  midnat-dev-network:
+    name: midnat-dev-network
+    driver: bridge

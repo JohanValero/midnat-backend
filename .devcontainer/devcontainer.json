@@ -1,0 +1,30 @@
+{
+  "name": "FastAPI Workspace",
+  "dockerComposeFile": "docker-compose.yaml",
+  "service": "backend",
+  "workspaceFolder": "/workspace",
+  "runArgs": ["-e", "COMPOSE_PROJECT_NAME=midnat-project"],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "ms-python.black-formatter"
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.black-formatter"
+      ]
+    }
+  },
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": {
+      "label": "FastAPI Backend Server",
+      "onAutoForward": "notify"
+    }
+  },
+  "postCreateCommand": "pip install fastapi uvicorn",
+  "remoteUser": "vscode"
+}
