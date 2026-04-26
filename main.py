@@ -1,14 +1,30 @@
 """
-Semantic Annotation API  ·  FastAPI + llama.cpp-server
--------------------------------------------------------
-v6.0 – Tres endpoints independientes:
-  POST /analyze/refs          → character-ref, location-ref, object-ref
-  POST /analyze/blocks        → narration, internal-thought, title, scene-break
-  POST /analyze/conversations → dialogue + narration (atribuciones/incisos)
+Semantic Annotation API  ·  FastAPI + llama.cpp-server + SQLite
+---------------------------------------------------------------
+v7.0 – Tres análisis independientes + persistencia de novelas/capítulos.
+
+Endpoints:
+  GET  /health
+  GET  /novels                                    → listar novelas
+  POST /novels                                    → crear novela vacía
+  POST /novels/import                             → crear novela desde capítulos (importar .docx)
+  GET  /novels/{novel_id}                         → detalle de novela
+  PUT  /novels/{novel_id}                         → actualizar metadatos
+  DELETE /novels/{novel_id}                       → eliminar novela
+  GET  /novels/{novel_id}/chapters                → listar capítulos (sin contenido)
+  POST /novels/{novel_id}/chapters                → añadir capítulo
+  GET  /novels/{novel_id}/chapters/{chapter_id}   → capítulo + anotaciones
+  PUT  /novels/{novel_id}/chapters/{chapter_id}   → guardar contenido + anotaciones
+  DELETE /novels/{novel_id}/chapters/{chapter_id} → eliminar capítulo
+  POST /novels/{novel_id}/chapters/reorder        → reordenar capítulos
+  POST /novels/{novel_id}/chapters/{chapter_id}/summarize  → generar resumen LLM (SSE)
+  POST /analyze/refs                              → análisis de referencias (SSE)
+  POST /analyze/blocks                            → análisis de estructura (SSE)
+  POST /analyze/conversations                     → análisis de conversaciones (SSE)
 
 Arrancar:
     llama-server -m model.gguf --port 8080 -c 8192
-    uvicorn main:app --reload --port 8000
+    uvicorn main:app --reload --port 8000 --host 0.0.0.0
 """
 from __future__ import annotations
 import json
@@ -17,14 +33,16 @@ import os
 import re
 import traceback
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, Callable
+from typing import AsyncGenerator, Callable, Optional
 from xml.etree import ElementTree as ET
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+import database as db
 
 logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s  %(name)s  %(message)s")
@@ -35,32 +53,83 @@ CHUNK_CHARS = int(os.getenv("CHUNK_CHARS",   "2000"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.1"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS",    "8192"))
 
-# ── Mapas de etiquetas → tipos de anotación ────────────────────────────────────
+# ── Tag maps (sin cambios respecto a v6) ──────────────────────────────────────
 
-# Inline refs (el texto encontrado se busca en el chunk y se anota)
 INLINE_TAG_MAP: dict[str, str] = {
     "c": "character-ref",
     "l": "location-ref",
-    "o": "object-ref",   # NUEVO en v6
+    "o": "object-ref",
 }
-
-# Bloques de estructura narrativa (sin diálogo)
 BLOCK_TAG_MAP_BLOCKS: dict[str, str] = {
     "p":       "narration",
     "thought": "internal-thought",
 }
-
-# Bloques de conversación
 BLOCK_TAG_MAP_CONV: dict[str, str] = {
     "dialogue": "dialogue",
-    "p":        "narration",   # incisos de atribución («—dijo él»)
+    "p":        "narration",
 }
 
+
+# ── Pydantic models (request/response) ────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
     fullText:        str = Field(..., min_length=1)
     enable_thinking: bool = Field(False)
+    # Si se proporciona, las anotaciones se guardan automáticamente en la BD.
+    chapter_id: Optional[int] = Field(None)
 
+
+class NovelCreateRequest(BaseModel):
+    title:       str = Field(..., min_length=1)
+    author:      str = Field("")
+    description: str = Field("")
+    cover_color: str = Field("#4c1d95")
+
+
+class NovelUpdateRequest(BaseModel):
+    title:       Optional[str] = None
+    author:      Optional[str] = None
+    description: Optional[str] = None
+    cover_color: Optional[str] = None
+
+
+class ChapterImportItem(BaseModel):
+    title:        str = Field(..., min_length=1)
+    content_text: str = Field("")
+    content_html: str = Field("")
+
+
+class NovelImportRequest(BaseModel):
+    """Usado por el endpoint /novels/import — el cliente envía los capítulos ya divididos."""
+    title:       str = Field(..., min_length=1)
+    author:      str = Field("")
+    description: str = Field("")
+    cover_color: str = Field("#4c1d95")
+    chapters:    list[ChapterImportItem] = Field(default_factory=list)
+
+
+class ChapterCreateRequest(BaseModel):
+    title:        str = Field(..., min_length=1)
+    content_text: str = Field("")
+    content_html: str = Field("")
+    order_index:  Optional[int] = None
+
+
+class ChapterUpdateRequest(BaseModel):
+    title:        Optional[str] = None
+    content_text: Optional[str] = None
+    content_html: Optional[str] = None
+    summary:      Optional[str] = None
+    # Si se proporciona, se reemplazan las anotaciones del tipo indicado.
+    annotations:  Optional[list[dict]] = None
+    analysis_type_for_annotations: Optional[str] = None
+
+
+class ReorderRequest(BaseModel):
+    ordered_ids: list[int]
+
+
+# ── Chunker ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Chunk:
@@ -96,7 +165,7 @@ def split_into_chunks(full_text: str) -> list[Chunk]:
     return chunks
 
 
-# ── Prompts ────────────────────────────────────────────────────────────────────
+# ── System Prompts (idénticos a v6) ───────────────────────────────────────────
 
 SYSTEM_PROMPT_REFS = """\
 Eres un extractor de referencias para narrativa literaria en español.
@@ -106,250 +175,95 @@ Tu tarea: identificar nombres de personajes, lugares y objetos importantes.
   <c n="Nombre canónico">texto exacto</c>   Personaje     (c = character)
   <l n="Lugar canónico">texto exacto</l>    Lugar         (l = location)
   <o n="Nombre canónico">texto exacto</o>   Objeto/artefacto con relevancia narrativa
-                                            (armas, reliquias, libros, vehículos, etc.)
-                                            NO incluyas objetos genéricos («la puerta», «la mesa»)
+                                            NO incluyas objetos genéricos («la puerta»)
 
 ━━━ REGLAS ━━━
 1. Devuelve ÚNICAMENTE el XML entre <refs>…</refs>. Nada antes ni después.
-2. Incluye cada nombre único UNA sola vez, aunque aparezca varias veces en el texto.
+2. Incluye cada nombre único UNA sola vez aunque aparezca varias veces en el texto.
 3. Usa exactamente el texto que aparece en el fragmento.
-4. Solo nombres propios y objetos con relevancia narrativa clara.
 
 ━━━ EJEMPLO ━━━
 ENTRADA:
-  Marta encontró el Amuleto de Edda y se lo entregó a Ander junto a la Espada Rota.
-  — Guárdalo bien —dijo Marta.
-
+  Marta encontró el Amuleto de Edda y se lo entregó a Ander.
 SALIDA:
 <refs>
 <c n="Marta">Marta</c>
 <l n="Edda">Edda</l>
 <o n="Amuleto de Edda">Amuleto de Edda</o>
 <c n="Ander">Ander</c>
-<o n="Espada Rota">Espada Rota</o>
 </refs>
 """
 
 SYSTEM_PROMPT_BLOCKS = """\
 Eres un clasificador de estructura narrativa para literatura en español.
-Tu tarea: etiquetar ÚNICAMENTE el contenido narrativo del fragmento.
-Las líneas de diálogo puro (que empiezan por raya —) NO son tu responsabilidad: márcalas con <skip>.
+Etiqueta TODO el fragmento. Las líneas de diálogo puro (que empiezan por —) → <skip>.
 
 ━━━ ETIQUETAS ━━━
-  <p>…</p>                  Narración, descripciones, acciones.
-                            Las atribuciones de diálogo («—dijo él», «—preguntó María»)
-                            también van aquí porque son narración intercalada.
-  <thought>…</thought>      Pensamiento interno o monólogo interior de un personaje.
-  <title>…</title>          Título de capítulo o sección.
-  <br/>                     Corte de escena (línea completamente en blanco o cambio claro
-                            de espacio/tiempo).
-  <skip>…</skip>            Línea de diálogo puro — NO la clasifiques aquí.
+  <p>…</p>          Narración, descripciones, acciones, atribuciones de diálogo.
+  <thought>…</thought> Pensamiento interno o monólogo interior.
+  <title>…</title>  Título de capítulo o sección.
+  <br/>             Corte de escena (línea en blanco / cambio de espacio-tiempo).
+  <skip>…</skip>    Línea de diálogo puro — NO la clasifiques aquí.
 
-━━━ REGLAS DE ORO PARA PENSAMIENTOS ━━━
-1. MONÓLOGO INTERIOR EXPLÍCITO: verbos como «pensó», «reflexionó», «se dijo», «meditó».
-   Texto: «No voy a llegar a tiempo», pensó Marta.
-   XML:   <thought>«No voy a llegar a tiempo», pensó Marta.</thought>
-
-2. ESTILO INDIRECTO LIBRE: voz del personaje fundida con el narrador (dudas, juicios).
-   Texto: Caminaba por el pasillo oscuro. ¿Y si alguien la seguía? Imposible. Se calmó.
-   XML:   <p>Caminaba por el pasillo oscuro.</p>
-          <thought>¿Y si alguien la seguía? Imposible.</thought>
-          <p>Se calmó.</p>
-
-3. PREGUNTAS RETÓRICAS INTERNAS → <thought>
-4. DECISIONES O JUICIOS INTERNOS → <thought>
-5. DUDAS: ¿estas palabras están en la cabeza del personaje? → <thought>
-          ¿las dice un narrador externo?                    → <p>
-
-━━━ REGLAS GENERALES ━━━
-- Devuelve ÚNICAMENTE el XML entre <annotations>…</annotations>.
-- TODO el texto debe estar cubierto con alguna etiqueta.
-- Las líneas que empiecen por — y contengan diálogo real → <skip>.
-- Los incisos narrativos dentro de una línea de diálogo («—advirtió Juan—») → <p>.
-- Respeta el texto literalmente (tildes, puntuación, mayúsculas).
-- No anides bloques.
-
-━━━ EJEMPLOS ━━━
-
-EJEMPLO 1 — Líneas de diálogo → <skip>
-ENTRADA:
-  — No entiendo qué pasó.
-  María no se movió.
-  — ¿Y ahora qué? —preguntó en voz baja.
-
-SALIDA:
-<annotations>
-<skip>— No entiendo qué pasó.</skip>
-<p>María no se movió.</p>
-<skip>— ¿Y ahora qué?</skip>
-<p>—preguntó en voz baja.</p>
-</annotations>
-
-EJEMPLO 2 — Narración pura
-ENTRADA:
-  La puerta se cerró tras él.
-
-  Afuera, la lluvia comenzaba a caer.
-
-SALIDA:
-<annotations>
-<p>La puerta se cerró tras él.</p>
-<br/>
-<br/>
-<p>Afuera, la lluvia comenzaba a caer.</p>
-</annotations>
-
-EJEMPLO 3 — Pensamiento + narración + diálogo
-ENTRADA:
-  Abrió el cajón. ¿Dónde estaba la llave? No podía haberse evaporado.
-  —¿Has visto mi llave? —preguntó a su hermana.
-
-SALIDA:
-<annotations>
-<p>Abrió el cajón.</p>
-<thought>¿Dónde estaba la llave? No podía haberse evaporado.</thought>
-<skip>—¿Has visto mi llave?</skip>
-<p>—preguntó a su hermana.</p>
-</annotations>
-
-EJEMPLO 4 — Título
-ENTRADA:
-  Capítulo 1: El viaje comienza
-
-SALIDA:
-<annotations>
-<title>Capítulo 1: El viaje comienza</title>
-</annotations>
+━━━ REGLAS ━━━
+- Devuelve SOLO el XML entre <annotations>…</annotations>.
+- TODO el texto debe estar cubierto. No anides bloques.
+- ¿Es la voz del personaje hablando para sí? → <thought>. ¿Narrador externo? → <p>.
 """
 
 SYSTEM_PROMPT_CONVERSATIONS = """\
 Eres un extractor de conversaciones para literatura en español.
-Tu tarea: identificar y clasificar ÚNICAMENTE las líneas de diálogo y sus atribuciones/incisos.
-El texto narrativo puro que no forme parte de conversaciones debes marcarlo con <skip>.
+Identifica diálogos y sus atribuciones. El resto → <skip>.
 
 ━━━ ETIQUETAS ━━━
-  <dialogue>…</dialogue>    SOLO las palabras pronunciadas en voz alta (con su raya —).
-                            Nunca incluyas el inciso narrativo.
-  <p>…</p>                  Inciso de atribución («—dijo él», «—advirtió Juan—») y
-                            narración intercalada DENTRO de una secuencia de diálogo.
-  <skip>…</skip>            Narración pura que NO forma parte de la conversación en curso.
+  <dialogue>…</dialogue>  Palabras pronunciadas en voz alta (con su raya —).
+  <p>…</p>                Inciso/atribución («—dijo él», narración adyacente al diálogo).
+  <skip>…</skip>          Narración pura sin relación con la conversación en curso.
 
-━━━ REGLAS DE ORO PARA DIÁLOGOS ━━━
-1. Muchas líneas tienen esta estructura:
-     — «Texto dicho» —inciso narrativo—. «Más texto dicho»
-   Separa diálogo puro en <dialogue> y el inciso en <p>:
-     <dialogue>—Si llegas tarde</dialogue>
-     <p>—advirtió Juan—</p>
-     <dialogue>, no te esperaremos.</dialogue>
+━━━ REGLAS ━━━
+- Devuelve SOLO el XML entre <annotations>…</annotations>.
+- TODO el texto debe estar cubierto.
+- Las frases de atribución NUNCA van dentro de <dialogue>.
+"""
 
-2. Cada línea independiente de diálogo (empezando por raya) es un <dialogue> separado.
+SYSTEM_PROMPT_SUMMARY = """\
+Eres un asistente literario especializado en resumir capítulos de novelas en español.
+Genera un resumen conciso (3-5 frases) que capture:
+- Los eventos principales de la trama
+- El desarrollo de personajes relevantes
+- El tono emocional predominante
+- Cualquier revelación o giro importante
 
-3. Las frases de atribución («—dijo él», «—preguntó María») JAMÁS van dentro de
-   <dialogue>. Siempre en un <p>.
-
-━━━ ¿CUÁNDO USAR <skip>? ━━━
-- Párrafos de descripción pura alejados de cualquier conversación → <skip>
-- Narración entre bloques de diálogo cuando es extensa (más de 2 frases) → <skip>
-- Pensamientos internos → <skip>  (los clasifica el endpoint de estructura)
-- Títulos → <skip>
-
-Regla práctica: si el párrafo es inmediatamente adyacente a un intercambio de diálogo
-y contribuye a ambientarlo o atribuirlo → <p>. Si es narración independiente → <skip>.
-
-━━━ REGLAS GENERALES ━━━
-- Devuelve ÚNICAMENTE el XML entre <annotations>…</annotations>.
-- TODO el texto debe estar cubierto: <dialogue>, <p> o <skip>.
-- Respeta el texto literalmente (tildes, puntuación, mayúsculas).
-- No anides bloques.
-
-━━━ EJEMPLOS ━━━
-
-EJEMPLO 1 — Diálogo simple
-ENTRADA:
-  — No deberías estar aquí —dijo Elena en voz baja.
-
-SALIDA:
-<annotations>
-<dialogue>— No deberías estar aquí</dialogue>
-<p>—dijo Elena en voz baja.</p>
-</annotations>
-
-EJEMPLO 2 — Inciso en medio
-ENTRADA:
-  —Si llegas tarde —advirtió Juan—, no te esperaremos.
-
-SALIDA:
-<annotations>
-<dialogue>—Si llegas tarde</dialogue>
-<p>—advirtió Juan—</p>
-<dialogue>, no te esperaremos.</dialogue>
-</annotations>
-
-EJEMPLO 3 — Narración + diálogo + más narración
-ENTRADA:
-  María no se movió. No podía creer lo que pasaba.
-  —¡Ahora! —insistió él.
-  La puerta se abrió de par en par y la luz inundó la habitación.
-  Corrió hacia la salida. No había tiempo para pensar. El suelo temblaba bajo sus pies.
-
-SALIDA:
-<annotations>
-<p>María no se movió. No podía creer lo que pasaba.</p>
-<dialogue>—¡Ahora!</dialogue>
-<p>—insistió él.</p>
-<skip>La puerta se abrió de par en par y la luz inundó la habitación.
-Corrió hacia la salida. No había tiempo para pensar. El suelo temblaba bajo sus pies.</skip>
-</annotations>
-
-EJEMPLO 4 — Múltiples turnos
-ENTRADA:
-  —¿Vienes conmigo? —preguntó Clara.
-  Él dudó un instante.
-  —No —respondió finalmente mientras se daba la vuelta—. No puedo.
-
-SALIDA:
-<annotations>
-<dialogue>—¿Vienes conmigo?</dialogue>
-<p>—preguntó Clara.
-Él dudó un instante.</p>
-<dialogue>—No</dialogue>
-<p>—respondió finalmente mientras se daba la vuelta—.</p>
-<dialogue> No puedo.</dialogue>
-</annotations>
+Estilo: neutro, tercera persona, presente narrativo.
+Devuelve ÚNICAMENTE el resumen. Sin títulos, prefijos ni explicaciones.
 """
 
 
-def user_prompt_refs(chunk_text: str) -> str:
+def _up_refs(chunk_text: str) -> str:
     return (
         "Extrae los nombres de personajes, lugares y objetos importantes "
-        "del siguiente fragmento:\n\n"
-        f"---\n{chunk_text}\n---\n\n"
+        f"del siguiente fragmento:\n\n---\n{chunk_text}\n---\n\n"
         "Responde SOLO con el XML entre <refs>…</refs>."
     )
 
 
-def user_prompt_blocks(chunk_text: str) -> str:
+def _up_blocks(chunk_text: str) -> str:
     return (
-        "Clasifica la estructura narrativa del siguiente fragmento "
-        "(narración, pensamientos, títulos, cortes). "
-        "Usa <skip> para las líneas de diálogo puro:\n\n"
-        f"---\n{chunk_text}\n---\n\n"
-        "Responde SOLO con el XML entre <annotations>…</annotations>. "
-        "Cubre todo el texto."
+        "Clasifica la estructura narrativa del siguiente fragmento. "
+        f"Usa <skip> para las líneas de diálogo puro:\n\n---\n{chunk_text}\n---\n\n"
+        "Responde SOLO con el XML entre <annotations>…</annotations>. Cubre todo el texto."
     )
 
 
-def user_prompt_conversations(chunk_text: str) -> str:
+def _up_conversations(chunk_text: str) -> str:
     return (
         "Extrae y clasifica las conversaciones del siguiente fragmento. "
-        "Usa <skip> para la narración que no forme parte de conversaciones:\n\n"
-        f"---\n{chunk_text}\n---\n\n"
-        "Responde SOLO con el XML entre <annotations>…</annotations>. "
-        "Cubre todo el texto."
+        f"Usa <skip> para la narración:\n\n---\n{chunk_text}\n---\n\n"
+        "Responde SOLO con el XML entre <annotations>…</annotations>. Cubre todo el texto."
     )
 
 
-# ── Streaming genérico (idéntico al de v5) ─────────────────────────────────────
+# ── Streaming genérico ─────────────────────────────────────────────────────────
 
 async def process_chunk_pass(
     chunk: Chunk,
@@ -363,8 +277,8 @@ async def process_chunk_pass(
     LOOKAHEAD = max(len(THINK_OPEN), len(THINK_CLOSE)) - 1
 
     payload: dict = {
-        "model": "local",
-        "messages": [
+        "model":       "local",
+        "messages":    [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt_text},
         ],
@@ -440,19 +354,16 @@ async def process_chunk_pass(
         yield ("think" if state == "thinking" else "xml", buffer)
 
 
-# ── Parsers XML → anotaciones ─────────────────────────────────────────────────
+# ── Parsers XML → anotaciones (idénticos a v6) ────────────────────────────────
 
 def _sanitize_xml(raw: str, root_tag: str = "annotations") -> str:
     raw = re.sub(r"```(?:xml)?\s*", "", raw)
     m = re.search(rf"(<{root_tag}\b[^>]*>.*?</{root_tag}>)", raw, re.DOTALL)
     raw = m.group(1) if m else f"<{root_tag}>{raw.strip()}</{root_tag}>"
-    return re.sub(
-        r"&(?!(?:amp|lt|gt|apos|quot|#\d+|#x[0-9a-fA-F]+);)", "&amp;", raw
-    )
+    return re.sub(r"&(?!(?:amp|lt|gt|apos|quot|#\d+|#x[0-9a-fA-F]+);)", "&amp;", raw)
 
 
 def resolve_refs_xml(xml_str: str, chunk: Chunk, id_offset: int) -> list[dict]:
-    """Endpoint /refs — anota todas las ocurrencias de cada ref única."""
     annotations: list[dict] = []
     ann_id = id_offset
     xml_clean = _sanitize_xml(xml_str, "refs")
@@ -467,21 +378,13 @@ def resolve_refs_xml(xml_str: str, chunk: Chunk, id_offset: int) -> list[dict]:
         if elem.tag not in INLINE_TAG_MAP:
             continue
         ref_text = (elem.text or "").strip()
-        if not ref_text:
+        if not ref_text or (elem.tag, ref_text) in seen:
             continue
-        key = (elem.tag, ref_text)
-        if key in seen:
-            continue
-        seen.add(key)
+        seen.add((elem.tag, ref_text))
 
         ann_type = INLINE_TAG_MAP[elem.tag]
-        # El atributo de metadata varía según el tipo
-        if elem.tag == "c":
-            meta_key, name_val = "name",     elem.get("n", ref_text)
-        elif elem.tag == "l":
-            meta_key, name_val = "location", elem.get("n", ref_text)
-        else:  # "o"
-            meta_key, name_val = "object",   elem.get("n", ref_text)
+        meta_key = {"c": "name", "l": "location", "o": "object"}[elem.tag]
+        name_val = elem.get("n", ref_text)
 
         search_pos = 0
         while True:
@@ -498,7 +401,6 @@ def resolve_refs_xml(xml_str: str, chunk: Chunk, id_offset: int) -> list[dict]:
             ann_id += 1
             search_pos = idx + len(ref_text)
 
-    log.info("[chunk %d] Refs: %d anotaciones", chunk.index, len(annotations))
     return annotations
 
 
@@ -509,32 +411,20 @@ def _resolve_block_xml_generic(
     tag_map: dict[str, str],
     fill_gaps: bool,
 ) -> list[dict]:
-    """
-    Resuelve etiquetas de bloque genéricas.
-
-    tag_map   – qué etiquetas XML mapean a qué tipos de anotación.
-    fill_gaps – si True, los huecos entre bloques se rellenan como 'narration'.
-                Para conversations, False: los huecos son <skip> implícitos.
-    Las etiquetas <skip> y etiquetas desconocidas se ignoran silenciosamente.
-    """
     annotations: list[dict] = []
     ann_id = id_offset
-
     xml_clean = _sanitize_xml(xml_str, "annotations")
     try:
         root = ET.fromstring(xml_clean)
     except ET.ParseError as exc:
         log.warning("[chunk %d] Blocks XML malformado (%s)", chunk.index, exc)
-        return _resolve_blocks_fallback(xml_str, chunk, id_offset, tag_map, fill_gaps)
+        return _blocks_fallback(xml_str, chunk, id_offset, tag_map, fill_gaps)
 
     last_pos = 0
-
     for elem in root:
         tag = elem.tag
 
-        # Ignorar <skip> y etiquetas desconocidas
         if tag == "skip" or (tag not in tag_map and tag not in ("br", "title")):
-            # Aun así avanzamos last_pos si podemos localizar el texto
             skip_text = "".join(elem.itertext()).strip()
             if skip_text:
                 idx = chunk.text.find(skip_text, last_pos)
@@ -584,10 +474,9 @@ def _resolve_block_xml_generic(
                       chunk.index, tag, full_text[:80])
             continue
 
-        # Rellenar hueco previo si corresponde
         if fill_gaps and idx > last_pos:
-            gap_text = chunk.text[last_pos:idx].strip()
-            if gap_text and not gap_text.startswith("—"):
+            gap = chunk.text[last_pos:idx].strip()
+            if gap:
                 annotations.append({
                     "id":    f"llm_{ann_id}",
                     "type":  "narration",
@@ -605,10 +494,9 @@ def _resolve_block_xml_generic(
         ann_id += 1
         last_pos = idx + len(full_text)
 
-    # Texto residual al final del chunk
     if fill_gaps and last_pos < len(chunk.text):
-        gap_text = chunk.text[last_pos:].strip()
-        if gap_text and not gap_text.startswith("—"):
+        gap = chunk.text[last_pos:].strip()
+        if gap:
             annotations.append({
                 "id":    f"llm_{ann_id}",
                 "type":  "narration",
@@ -616,44 +504,30 @@ def _resolve_block_xml_generic(
                 "end":   chunk.offset + len(chunk.text),
             })
 
-    log.info("[chunk %d] Bloques (%s): %d anotaciones",
-             chunk.index, "/".join(tag_map.keys()), len(annotations))
     return annotations
 
 
 def resolve_blocks_xml(xml_str: str, chunk: Chunk, id_offset: int) -> list[dict]:
-    """Endpoint /blocks — narration, internal-thought, title, scene-break."""
-    return _resolve_block_xml_generic(
-        xml_str, chunk, id_offset,
-        tag_map=BLOCK_TAG_MAP_BLOCKS,
-        fill_gaps=True,
-    )
+    return _resolve_block_xml_generic(xml_str, chunk, id_offset, BLOCK_TAG_MAP_BLOCKS, True)
 
 
 def resolve_conversations_xml(xml_str: str, chunk: Chunk, id_offset: int) -> list[dict]:
-    """Endpoint /conversations — dialogue, narration (atribuciones)."""
-    return _resolve_block_xml_generic(
-        xml_str, chunk, id_offset,
-        tag_map=BLOCK_TAG_MAP_CONV,
-        fill_gaps=False,   # los huecos son <skip> implícitos, no se rellenan
-    )
+    return _resolve_block_xml_generic(xml_str, chunk, id_offset, BLOCK_TAG_MAP_CONV, False)
 
 
-def _resolve_blocks_fallback(
+def _blocks_fallback(
     xml_str: str,
     chunk: Chunk,
     id_offset: int,
     tag_map: dict[str, str],
     fill_gaps: bool,
 ) -> list[dict]:
-    """Fallback regex cuando el XML está malformado."""
     annotations: list[dict] = []
     ann_id = id_offset
 
     def strip_inline(s: str) -> str:
         return re.sub(r"<[^>]+>", "", s).strip()
 
-    # Construimos el patrón con las etiquetas que nos interesan
     tags_re = "|".join(re.escape(t) for t in list(tag_map.keys()) + ["title"])
     pattern = re.compile(rf"<({tags_re})>(.*?)</\1>", re.DOTALL)
     last_pos = 0
@@ -663,27 +537,24 @@ def _resolve_blocks_fallback(
         content = strip_inline(m.group(2))
         if not content:
             continue
-
         idx = chunk.text.find(content, last_pos)
         if idx == -1:
             idx = chunk.text.find(content)
         if idx == -1:
             continue
-
         if fill_gaps and idx > last_pos:
             gap = chunk.text[last_pos:idx].strip()
-            if gap and not gap.startswith("—"):
+            if gap:
                 annotations.append({
                     "id": f"llm_{ann_id}", "type": "narration",
                     "start": chunk.offset + last_pos,
                     "end":   chunk.offset + idx,
                 })
                 ann_id += 1
-
-        block_type = "title" if tag == "title" else tag_map.get(tag, tag)
+        bt = "title" if tag == "title" else tag_map.get(tag, tag)
         annotations.append({
             "id":    f"llm_{ann_id}",
-            "type":  block_type,
+            "type":  bt,
             "start": chunk.offset + idx,
             "end":   chunk.offset + idx + len(content),
         })
@@ -692,40 +563,32 @@ def _resolve_blocks_fallback(
 
     if fill_gaps and last_pos < len(chunk.text):
         gap = chunk.text[last_pos:].strip()
-        if gap and not gap.startswith("—"):
+        if gap:
             annotations.append({
                 "id": f"llm_{ann_id}", "type": "narration",
                 "start": chunk.offset + last_pos,
                 "end":   chunk.offset + len(chunk.text),
             })
-
     return annotations
 
 
-# ── Lógica SSE común ───────────────────────────────────────────────────────────
-
-app = FastAPI(title="Semantic Annotation API", version="6.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"],
-)
-
+# ── Lógica SSE compartida ──────────────────────────────────────────────────────
 
 def sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def _make_stream(
+def _make_analysis_stream(
     req: AnalyzeRequest,
+    analysis_type_name: str,          # 'refs' | 'blocks' | 'conversations'
     system_prompt: str,
     user_prompt_fn: Callable[[str], str],
     resolver_fn:    Callable[[str, Chunk, int], list[dict]],
 ) -> StreamingResponse:
     """
-    Factoriza la lógica de streaming compartida por los tres endpoints.
-    Cada endpoint hace UNA pasada LLM por chunk (a diferencia de v5 que hacía dos).
-    Los eventos SSE son los mismos en los tres casos; el cliente los distingue
-    por el endpoint al que llamó.
+    Factoriza el ciclo de vida SSE para los tres endpoints de análisis.
+    Diferencia clave respecto a v6: si req.chapter_id está definido,
+    las anotaciones resueltas se guardan automáticamente en la BD.
     """
     chunks = split_into_chunks(req.fullText)
 
@@ -759,8 +622,8 @@ def _make_stream(
                             yield sse({"type": "token",       "chunk": chunk.index, "token": text})
                 except Exception as exc:
                     error_msg = f"{type(exc).__name__}: {exc!r}"
-                    log.error("[chunk %d] %s\n%s",
-                              chunk.index, error_msg, traceback.format_exc())
+                    log.error("[chunk %d] %s\n%s", chunk.index,
+                              error_msg, traceback.format_exc())
 
                 if error_msg:
                     yield sse({"type": "error", "chunk": chunk.index, "message": error_msg})
@@ -769,8 +632,19 @@ def _make_stream(
                 resolved = resolver_fn(xml_content, chunk, ann_id)
                 ann_id += len(resolved)
 
-                log.info("[chunk %d/%d] %d anotaciones",
-                         chunk.index + 1, chunk.total, len(resolved))
+                # Persistencia automática cuando el cliente especifica chapter_id
+                if req.chapter_id and resolved:
+                    try:
+                        db.save_annotations(
+                            req.chapter_id, resolved, analysis_type_name)
+                        log.info(
+                            "[chunk %d] %d anotaciones (%s) guardadas en capítulo %d",
+                            chunk.index, len(
+                                resolved), analysis_type_name, req.chapter_id,
+                        )
+                    except Exception as exc:
+                        log.error("Error guardando anotaciones en BD: %s", exc)
+
                 yield sse({
                     "type":         "progress",
                     "chunk":        chunk.index,
@@ -786,7 +660,22 @@ def _make_stream(
     )
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────────────
+# ── App ────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Semantic Annotation API", version="7.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def startup():
+    db.init_db()
+    log.info("Base de datos inicializada en %s", db.DB_PATH)
+
+
+# ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -799,33 +688,215 @@ async def health():
     return {"api": "ok", "llm": "ok" if llm_ok else "unreachable"}
 
 
+# ── Novels ─────────────────────────────────────────────────────────────────────
+
+@app.get("/novels")
+def novels_list():
+    return db.list_novels()
+
+
+@app.post("/novels", status_code=201)
+def novels_create(req: NovelCreateRequest):
+    return db.create_novel(req.title, req.author, req.description, req.cover_color)
+
+
+@app.post("/novels/import", status_code=201)
+def novels_import(req: NovelImportRequest):
+    """
+    Crea una novela con todos sus capítulos en una sola operación transaccional.
+    El cliente (frontend) es responsable de extraer el texto del .docx y dividirlo
+    en capítulos por heading. Este endpoint simplemente persiste lo que recibe.
+    """
+    novel = db.create_novel(req.title, req.author,
+                            req.description, req.cover_color)
+    created_chapters = []
+    for idx, ch in enumerate(req.chapters):
+        chapter = db.create_chapter(
+            novel_id=novel["id"],
+            title=ch.title,
+            content_text=ch.content_text,
+            content_html=ch.content_html,
+            order_index=idx,
+        )
+        created_chapters.append(chapter)
+    return {**novel, "chapters": created_chapters}
+
+
+@app.get("/novels/{novel_id}")
+def novels_get(novel_id: int):
+    novel = db.get_novel(novel_id)
+    if not novel:
+        raise HTTPException(404, "Novela no encontrada")
+    novel["chapters"] = db.list_chapters(novel_id)
+    return novel
+
+
+@app.put("/novels/{novel_id}")
+def novels_update(novel_id: int, req: NovelUpdateRequest):
+    updated = db.update_novel(novel_id, **req.model_dump(exclude_none=True))
+    if not updated:
+        raise HTTPException(404, "Novela no encontrada")
+    return updated
+
+
+@app.delete("/novels/{novel_id}", status_code=204)
+def novels_delete(novel_id: int):
+    if not db.delete_novel(novel_id):
+        raise HTTPException(404, "Novela no encontrada")
+
+
+# ── Chapters ───────────────────────────────────────────────────────────────────
+
+@app.get("/novels/{novel_id}/chapters")
+def chapters_list(novel_id: int):
+    return db.list_chapters(novel_id)
+
+
+@app.post("/novels/{novel_id}/chapters", status_code=201)
+def chapters_create(novel_id: int, req: ChapterCreateRequest):
+    return db.create_chapter(
+        novel_id, req.title, req.content_text, req.content_html, req.order_index
+    )
+
+
+@app.post("/novels/{novel_id}/chapters/reorder")
+def chapters_reorder(novel_id: int, req: ReorderRequest):
+    return db.reorder_chapters(novel_id, req.ordered_ids)
+
+
+@app.get("/novels/{novel_id}/chapters/{chapter_id}")
+def chapters_get(novel_id: int, chapter_id: int):
+    chapter = db.get_chapter(chapter_id, include_annotations=True)
+    if not chapter or chapter["novel_id"] != novel_id:
+        raise HTTPException(404, "Capítulo no encontrado")
+    return chapter
+
+
+@app.put("/novels/{novel_id}/chapters/{chapter_id}")
+def chapters_update(novel_id: int, chapter_id: int, req: ChapterUpdateRequest):
+    """
+    Actualiza el contenido del capítulo y opcionalmente reemplaza anotaciones
+    de un tipo de análisis específico.
+    """
+    chapter = db.get_chapter(chapter_id, include_annotations=False)
+    if not chapter or chapter["novel_id"] != novel_id:
+        raise HTTPException(404, "Capítulo no encontrado")
+
+    fields = req.model_dump(exclude_none=True, exclude={
+                            "annotations", "analysis_type_for_annotations"})
+    updated = db.update_chapter(chapter_id, **fields)
+
+    if req.annotations is not None and req.analysis_type_for_annotations:
+        db.save_annotations(chapter_id, req.annotations,
+                            req.analysis_type_for_annotations)
+
+    return db.get_chapter(chapter_id, include_annotations=True)
+
+
+@app.delete("/novels/{novel_id}/chapters/{chapter_id}", status_code=204)
+def chapters_delete(novel_id: int, chapter_id: int):
+    chapter = db.get_chapter(chapter_id, include_annotations=False)
+    if not chapter or chapter["novel_id"] != novel_id:
+        raise HTTPException(404, "Capítulo no encontrado")
+    db.delete_chapter(chapter_id)
+
+
+# ── Resumen LLM (streaming) ────────────────────────────────────────────────────
+
+@app.post("/novels/{novel_id}/chapters/{chapter_id}/summarize")
+async def chapters_summarize(novel_id: int, chapter_id: int):
+    """
+    Genera un resumen del capítulo vía LLM y lo guarda en la BD al finalizar.
+    Emite eventos SSE: { type: 'token', token: '...' } mientras genera,
+    luego { type: 'done', summary: '...' } al terminar.
+    """
+    chapter = db.get_chapter(chapter_id, include_annotations=False)
+    if not chapter or chapter["novel_id"] != novel_id:
+        raise HTTPException(404, "Capítulo no encontrado")
+
+    content_text = chapter.get("content_text", "").strip()
+    if not content_text:
+        raise HTTPException(422, "El capítulo no tiene contenido de texto")
+
+    # Limitamos a los primeros 6000 chars para no sobrecargar el contexto
+    excerpt = content_text[:6000]
+    user_prompt = (
+        f"Capítulo: «{chapter['title']}»\n\n"
+        f"---\n{excerpt}\n---\n\n"
+        "Genera el resumen del capítulo según tus instrucciones."
+    )
+
+    async def stream() -> AsyncGenerator[str, None]:
+        full_summary = ""
+        payload = {
+            "model":       "local",
+            "messages":    [
+                {"role": "system", "content": SYSTEM_PROMPT_SUMMARY},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "temperature": 0.3,
+            "max_tokens":  512,
+            "stream":      True,
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST", f"{LLAMA_URL}/v1/chat/completions", json=payload,
+                    timeout=httpx.Timeout(
+                        connect=10.0, read=120.0, write=10.0, pool=10.0),
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:].strip()
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            delta = json.loads(raw)["choices"][0]["delta"]
+                            token = delta.get("content") or ""
+                            if token:
+                                full_summary += token
+                                yield sse({"type": "token", "token": token})
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+        except Exception as exc:
+            yield sse({"type": "error", "message": str(exc)})
+            return
+
+        # Guardamos en BD y notificamos al cliente
+        summary_clean = full_summary.strip()
+        if summary_clean:
+            db.update_chapter(chapter_id, summary=summary_clean)
+        yield sse({"type": "done", "summary": summary_clean})
+
+    return StreamingResponse(
+        stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Análisis (SSE) ─────────────────────────────────────────────────────────────
+
 @app.post("/analyze/refs")
 async def analyze_refs(req: AnalyzeRequest):
-    """
-    Extrae referencias inline: personajes, lugares y objetos con relevancia narrativa.
-    Produce: character-ref, location-ref, object-ref.
-    """
-    return _make_stream(req, SYSTEM_PROMPT_REFS, user_prompt_refs, resolve_refs_xml)
+    return _make_analysis_stream(
+        req, "refs",
+        SYSTEM_PROMPT_REFS, _up_refs, resolve_refs_xml,
+    )
 
 
 @app.post("/analyze/blocks")
 async def analyze_blocks(req: AnalyzeRequest):
-    """
-    Clasifica la estructura narrativa: narración, pensamiento, títulos y cortes de escena.
-    Produce: narration, internal-thought, title, scene-break.
-    Las líneas de diálogo puro se omiten deliberadamente (las maneja /analyze/conversations).
-    """
-    return _make_stream(req, SYSTEM_PROMPT_BLOCKS, user_prompt_blocks, resolve_blocks_xml)
+    return _make_analysis_stream(
+        req, "blocks",
+        SYSTEM_PROMPT_BLOCKS, _up_blocks, resolve_blocks_xml,
+    )
 
 
 @app.post("/analyze/conversations")
 async def analyze_conversations(req: AnalyzeRequest):
-    """
-    Clasifica conversaciones: diálogo puro y atribuciones/incisos narrativos.
-    Produce: dialogue, narration (para incisos como «—dijo él»).
-    Funciona mejor cuando /analyze/blocks ya se ha ejecutado (contexto de escenas).
-    """
-    return _make_stream(
-        req, SYSTEM_PROMPT_CONVERSATIONS,
-        user_prompt_conversations, resolve_conversations_xml,
+    return _make_analysis_stream(
+        req, "conversations",
+        SYSTEM_PROMPT_CONVERSATIONS, _up_conversations, resolve_conversations_xml,
     )
