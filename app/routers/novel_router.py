@@ -1,9 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.schemas import NovelCreate, NovelResponse, NovelUpdate
-from app.services import novel_service
+from app.schemas import (
+    NovelCreate, NovelResponse, NovelUpdate,
+    NovelEntityDetailResponse, NovelEntitySummaryResponse,
+)
+from app.services import novel_service, novel_entity_service
 
 
 router: APIRouter = APIRouter(prefix="/novels", tags=["Novels"])
@@ -47,3 +51,32 @@ def update_novel(novel_id: int, data: NovelUpdate, db: Session = Depends(get_db)
 def delete_novel(novel_id: int, db: Session = Depends(get_db)):
     if not novel_service.delete_novel(db, novel_id):
         raise HTTPException(status_code=404, detail="Novel not found")
+
+
+# ── Novel Entities (entidades canónicas consolidadas) ─────────────────────────
+
+@router.post("/{novel_id}/consolidate-entities")
+async def consolidate_entities(novel_id: int, db: Session = Depends(get_db)):
+    """
+    Consolida las entidades de capítulo en entidades canónicas a nivel de novela.
+    Limpia huérfanas, agrupa con LLM, genera descripciones. SSE stream.
+    """
+    n = novel_service.get_novel(db, novel_id)
+    if not n:
+        raise HTTPException(status_code=404, detail="Novel not found")
+
+    return StreamingResponse(
+        novel_entity_service.consolidate_entities_stream(novel_id, db),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/{novel_id}/novel-entities")
+def get_novel_entities(novel_id: int, db: Session = Depends(get_db)):
+    """Devuelve las entidades canónicas con fragmentos y aliases consolidados."""
+    n = novel_service.get_novel(db, novel_id)
+    if not n:
+        raise HTTPException(status_code=404, detail="Novel not found")
+    return novel_entity_service.get_novel_entities_detail(db, novel_id)
+

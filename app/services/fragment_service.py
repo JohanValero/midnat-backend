@@ -145,6 +145,89 @@ def delete_fragment(db: Session, fragment_id: int) -> bool:
     return True
 
 
+import difflib
+
+def bulk_sync_fragments(db: Session, chapter_id: int, blocks: list[str]) -> list[Fragment]:
+    """Sincroniza los fragmentos usando diff para minimizar actualizaciones y usar orden intermedio."""
+    existing_fragments = get_fragments_by_chapter(db, chapter_id)
+    existing_texts = [f.content for f in existing_fragments]
+    
+    matcher = difflib.SequenceMatcher(None, existing_texts, blocks)
+    final_sequence = []
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            final_sequence.extend(existing_fragments[i1:i2])
+        elif tag == 'delete':
+            for i in range(i1, i2):
+                db.delete(existing_fragments[i])
+        elif tag == 'replace':
+            common_len = min(i2 - i1, j2 - j1)
+            for k in range(common_len):
+                frag = existing_fragments[i1 + k]
+                new_content = blocks[j1 + k]
+                new_hash = _hash(new_content)
+                if frag.content != new_content or frag.content_hash != new_hash:
+                    frag.content = new_content
+                    frag.content_hash = new_hash
+                final_sequence.append(frag)
+                
+            if (i2 - i1) > common_len:
+                for k in range(common_len, i2 - i1):
+                    db.delete(existing_fragments[i1 + k])
+            else:
+                for k in range(common_len, j2 - j1):
+                    final_sequence.append(blocks[j1 + k])
+        elif tag == 'insert':
+            for k in range(j1, j2):
+                final_sequence.append(blocks[k])
+                
+    def assign_orders(seq):
+        i = 0
+        while i < len(seq):
+            if isinstance(seq[i], str):
+                start = i
+                while i < len(seq) and isinstance(seq[i], str):
+                    i += 1
+                end = i
+                
+                prev_order = seq[start-1].order if start > 0 else 0
+                if end < len(seq):
+                    next_order = seq[end].order
+                else:
+                    next_order = prev_order + 1000 * ((end - start) + 1)
+                
+                space = next_order - prev_order
+                num_inserts = end - start
+                
+                if space <= num_inserts:
+                    return False
+                
+                step = space // (num_inserts + 1)
+                for k in range(num_inserts):
+                    order = prev_order + step * (k + 1)
+                    new_frag = Fragment(
+                        chapter_id=chapter_id,
+                        content=seq[start+k],
+                        content_hash=_hash(seq[start+k]),
+                        order=order
+                    )
+                    db.add(new_frag)
+                    seq[start+k] = new_frag
+            else:
+                i += 1
+        return True
+
+    if not assign_orders(final_sequence):
+        db.commit()
+        rebalance_fragments(db, chapter_id)
+        if not assign_orders(final_sequence):
+            raise Exception("Order space exhausted even after rebalancing.")
+            
+    db.commit()
+    return get_fragments_by_chapter(db, chapter_id)
+
+
 # ── Rebalanceo ────────────────────────────────────────────────────────────────
 
 def rebalance_fragments(db: Session, chapter_id: int) -> list[Fragment]:

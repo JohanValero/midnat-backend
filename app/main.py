@@ -15,6 +15,7 @@ from app.config import settings
 from app.database import init_db
 from app.routers import (
     chapter_router,
+    chat_router,
     entity_router,
     fragment_router,
     novel_router,
@@ -51,6 +52,7 @@ app.include_router(chapter_router.router)
 app.include_router(scene_router.router)
 app.include_router(fragment_router.router)
 app.include_router(entity_router.router)
+app.include_router(chat_router.router)
 
 
 @app.get("/", tags=["Health"])

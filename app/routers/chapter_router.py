@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -6,11 +7,58 @@ from app.schemas import (
     ChapterCreate, ChapterHistoryResponse, ChapterResponse,
     ChapterUpdate, PublishChapterRequest,
 )
-from app.services import chapter_service
+from app.services import chapter_service, fragment_service, llm_service, scene_generator_service, entity_generator_service, entity_service
 
 router = APIRouter(prefix="/chapters", tags=["Chapters"])
 
+@router.post("/{chapter_id}/summarize")
+async def summarize_chapter(chapter_id: int, db: Session = Depends(get_db)):
+    c = chapter_service.get_chapter(db, chapter_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+        
+    fragments = fragment_service.get_fragments_by_chapter(db, chapter_id)
+    text_content = "\n\n".join([f.content for f in fragments])
+    
+    return StreamingResponse(
+        llm_service.generate_chapter_summary_stream(text_content),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
+
+@router.post("/{chapter_id}/generate-scenes")
+async def generate_scenes(chapter_id: int, db: Session = Depends(get_db)):
+    c = chapter_service.get_chapter(db, chapter_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+
+    return StreamingResponse(
+        scene_generator_service.generate_scenes_stream(chapter_id, db),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/{chapter_id}/generate-entities")
+async def generate_entities(chapter_id: int, db: Session = Depends(get_db)):
+    c = chapter_service.get_chapter(db, chapter_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+
+    return StreamingResponse(
+        entity_generator_service.generate_entities_stream(chapter_id, db),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/{chapter_id}/entities")
+def get_chapter_entities(chapter_id: int, db: Session = Depends(get_db)):
+    c = chapter_service.get_chapter(db, chapter_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    return entity_service.get_entities_by_chapter(db, chapter_id)
 # ── NovelChapter CRUD ─────────────────────────────────────────────────────────
 
 @router.get("/by-novel/{novel_id}", response_model=list[ChapterResponse])

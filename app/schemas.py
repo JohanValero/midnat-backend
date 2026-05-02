@@ -88,6 +88,7 @@ class ChapterHistoryResponse(BaseModel):
 class ChapterBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=255)
     chapter_number: int = Field(..., ge=1)
+    summary: Optional[str] = None
 
 
 class ChapterCreate(ChapterBase):
@@ -97,6 +98,7 @@ class ChapterCreate(ChapterBase):
 class ChapterUpdate(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=255)
     chapter_number: Optional[int] = Field(None, ge=1)
+    summary: Optional[str] = None
 
 
 class ChapterResponse(ChapterBase):
@@ -138,9 +140,13 @@ class SceneUpdate(SceneBase):
 class SceneResponse(SceneBase):
     id: int
     chapter_id: int
+    fragmentIds: list[int] = Field(default=[], validation_alias="fragment_ids")
+    fragmentCount: int = Field(default=0, validation_alias="fragment_count")
+    wordCount: int = Field(default=0, validation_alias="word_count")
+    charCount: int = Field(default=0, validation_alias="char_count")
     created_at: datetime
     updated_at: datetime
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -176,6 +182,11 @@ class FragmentUpdate(BaseModel):
     order: Optional[int] = Field(None, ge=0)
 
 
+class FragmentBulkSync(BaseModel):
+    chapter_id: int
+    blocks: list[str]
+
+
 class FragmentResponse(FragmentBase):
     id: int
     chapter_id: int
@@ -204,13 +215,92 @@ class EntityUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     entity_type: Optional[str] = Field(None, min_length=1, max_length=100)
     description: Optional[str] = None
+    novel_entity_id: Optional[int] = None
 
 
 class EntityResponse(EntityBase):
     id: int
     project_id: int
+    novel_entity_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  NovelEntity (entidades canónicas a nivel de novela)
+# ═══════════════════════════════════════════════════════════════════
+
+class NovelEntityBase(BaseModel):
+    canonical_name: str = Field(..., min_length=1, max_length=255)
+    entity_type: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = None
+
+
+class NovelEntityCreate(NovelEntityBase):
+    novel_id: int
+
+
+class NovelEntityUpdate(BaseModel):
+    canonical_name: Optional[str] = Field(None, min_length=1, max_length=255)
+    entity_type: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = None
+
+
+class ChildEntityInfo(BaseModel):
+    """Info de una entidad de capítulo que pertenece a una NovelEntity."""
+    id: int
+    name: str
+    entity_type: str
+    fragment_count: int = 0
+    aliases: list[str] = []
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NovelEntitySummaryResponse(NovelEntityBase):
+    """Respuesta resumida de NovelEntity para listados."""
+    id: int
+    novel_id: int
+    created_at: datetime
+    updated_at: datetime
+    child_entities: list[ChildEntityInfo] = []
+    total_fragments: int = 0
+    all_aliases: list[str] = []
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NovelEntityFragment(BaseModel):
+    id: int
+    content: str
+    chapter_id: int
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NovelEntityDetailResponse(NovelEntityBase):
+    """Respuesta detallada de NovelEntity con todos los fragmentos."""
+    id: int
+    novel_id: int
+    fragments: list[NovelEntityFragment]
+    all_aliases: list[str]
+    child_entities: list[ChildEntityInfo] = []
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+# Legacy schema for chapter-level entity view (backwards compatible)
+class ChapterEntityFragment(BaseModel):
+    id: int
+    content: str
+    chapter_id: int
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ChapterEntityResponse(EntityBase):
+    id: int
+    project_id: int
+    fragments: list[ChapterEntityFragment]
+    aliases: list[str]
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -258,3 +348,27 @@ class EntityRelationResponse(EntityRelationBase):
     created_at: datetime
     updated_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Chat (Asistente de IA conversacional)
+# ═══════════════════════════════════════════════════════════════════
+
+class ChatMessageItem(BaseModel):
+    """Un mensaje en el historial de conversación."""
+    role: str = Field(..., pattern=r"^(user|assistant)$")
+    content: str
+
+
+class ChatRequest(BaseModel):
+    """Petición de chat conversacional con contexto seleccionable."""
+    prompt: str = Field(..., min_length=1)
+    novel_id: int
+    chapter_ids: list[int] = Field(
+        default=[],
+        description="IDs de capítulos para usar como contexto. Vacío = toda la novela.",
+    )
+    history: list[ChatMessageItem] = Field(
+        default=[],
+        description="Historial previo de la conversación.",
+    )

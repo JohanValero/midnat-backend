@@ -39,8 +39,6 @@ class Project(Base):
 
     novels = relationship("Novel",  back_populates="project",
                           cascade="all, delete-orphan")
-    entities = relationship(
-        "Entity", back_populates="project", cascade="all, delete-orphan")
 
 
 class Novel(Base):
@@ -58,6 +56,8 @@ class Novel(Base):
     project = relationship("Project", back_populates="novels")
     chapters = relationship(
         "NovelChapter", back_populates="novel", cascade="all, delete-orphan")
+    novel_entities = relationship(
+        "NovelEntity", back_populates="novel", cascade="all, delete-orphan")
 
 
 class NovelChapter(Base):
@@ -71,6 +71,7 @@ class NovelChapter(Base):
     current_history_id = Column(Integer, nullable=True)
     title = Column(String(255), nullable=False)
     chapter_number = Column(Integer, nullable=False)
+    summary = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(),
                         onupdate=func.now())
@@ -114,6 +115,25 @@ class ChapterHistory(Base):
     )
 
 
+class NovelEntity(Base):
+    """Entidad canónica a nivel de novela. Consolida variaciones/aliases de la misma entidad
+    detectadas en diferentes capítulos."""
+    __tablename__ = "TB_NOVEL_ENTITY"
+
+    id = Column(Integer, primary_key=True, index=True)
+    novel_id = Column(Integer, ForeignKey(
+        "TB_NOVEL.id", ondelete="CASCADE"), nullable=False)
+    canonical_name = Column(String(255), nullable=False)
+    entity_type = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(),
+                        onupdate=func.now())
+
+    novel = relationship("Novel", back_populates="novel_entities")
+    entities = relationship("Entity", back_populates="novel_entity")
+
+
 class Scene(Base):
     __tablename__ = "TB_SCENE"
 
@@ -130,6 +150,28 @@ class Scene(Base):
     chapter = relationship("NovelChapter", back_populates="scenes")
     fragments = relationship("Fragment", back_populates="scene")
 
+    @property
+    def fragment_ids(self) -> list[int]:
+        return [f.id for f in self.fragments]
+
+    @property
+    def fragment_count(self) -> int:
+        return len(self.fragments)
+
+    @property
+    def word_count(self) -> int:
+        import re
+        def strip_tags(text):
+            return re.sub(r'<[^>]+>', '', text)
+        return sum(len(strip_tags(f.content).split()) for f in self.fragments)
+
+    @property
+    def char_count(self) -> int:
+        import re
+        def strip_tags(text):
+            return re.sub(r'<[^>]+>', '', text)
+        return sum(len(strip_tags(f.content)) for f in self.fragments)
+
 
 class Fragment(Base):
     __tablename__ = "TB_FRAGMENT"
@@ -141,7 +183,7 @@ class Fragment(Base):
                       ondelete="SET NULL"), nullable=True)
     content = Column(Text, nullable=False)
     # SHA-256 hex del contenido — huella única, se recalcula si cambia content
-    content_hash = Column(String(64), unique=True, nullable=False, index=True)
+    content_hash = Column(String(64), unique=False, nullable=False, index=True)
     # Ordenación en pasos de 1000. Inserción entre dos fragmentos → (prev+next)//2
     order = Column(Integer, nullable=False)
     # JSON flexible: anotaciones del LLM, entidades extraídas, tipo de fragmento, etc.
@@ -162,6 +204,8 @@ class Entity(Base):
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey(
         "TB_PROJECT.id", ondelete="CASCADE"), nullable=False)
+    novel_entity_id = Column(Integer, ForeignKey(
+        "TB_NOVEL_ENTITY.id", ondelete="SET NULL"), nullable=True)
     name = Column(String(255), nullable=False)
     # Valores sugeridos: character | object | worldbuilding | historical_moment | concept | location
     entity_type = Column(String(100), nullable=False)
@@ -170,7 +214,8 @@ class Entity(Base):
     updated_at = Column(DateTime, server_default=func.now(),
                         onupdate=func.now())
 
-    project = relationship("Project", back_populates="entities")
+    project = relationship("Project")
+    novel_entity = relationship("NovelEntity", back_populates="entities")
     entity_fragments = relationship(
         "EntityFragment", back_populates="entity", cascade="all, delete-orphan")
     relations_as_a = relationship(
@@ -190,6 +235,7 @@ class EntityFragment(Base):
         "TB_ENTITY.id",   ondelete="CASCADE"), nullable=False)
     fragment_id = Column(Integer, ForeignKey(
         "TB_FRAGMENT.id", ondelete="CASCADE"), nullable=False)
+    alias_in_text = Column(String(255), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
     __table_args__ = (

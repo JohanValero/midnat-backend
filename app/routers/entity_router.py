@@ -6,7 +6,7 @@ from app.database import get_db
 from app.schemas import (
     EntityCreate, EntityFragmentCreate, EntityFragmentResponse,
     EntityRelationCreate, EntityRelationResponse, EntityRelationUpdate,
-    EntityResponse, EntityUpdate,
+    EntityResponse, EntityUpdate, ChapterEntityResponse
 )
 from app.services import entity_service
 
@@ -23,6 +23,12 @@ def list_entities(
 ):
     """Filtra opcionalmente por tipo: character, location, worldbuilding, etc."""
     return entity_service.get_entities_by_project(db, project_id, entity_type)
+
+
+@router.get("/by-novel/{novel_id}", response_model=list[ChapterEntityResponse])
+def list_entities_by_novel(novel_id: int, db: Session = Depends(get_db)):
+    """Devuelve las entidades de capítulo que aparecen en la novela con sus fragmentos."""
+    return entity_service.get_entities_by_novel(db, novel_id)
 
 
 @router.post("/", response_model=EntityResponse, status_code=status.HTTP_201_CREATED)

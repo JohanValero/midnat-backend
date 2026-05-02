@@ -5,9 +5,9 @@ Agrupa los tres dominios porque están estrechamente relacionados:
 el flujo típico es crear entidades → vincularlas a fragmentos →
 definir las relaciones entre ellas.
 """
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
-from app.models import Entity, EntityFragment, EntityRelation
+from app.models import Entity, EntityFragment, EntityRelation, Fragment, NovelChapter
 from app.schemas import (
     EntityCreate, EntityUpdate,
     EntityFragmentCreate,
@@ -162,3 +162,160 @@ def delete_relation(db: Session, relation_id: int) -> bool:
     db.delete(rel)
     db.commit()
     return True
+
+
+# ── Chapter-level operations ──────────────────────────────────────────────────
+
+def delete_entity_links_by_chapter(db: Session, chapter_id: int) -> int:
+    """
+    Borra todos los vínculos EntityFragment para fragmentos del capítulo.
+    No borra las entidades en sí (son a nivel de proyecto y pueden estar
+    vinculadas a otros capítulos).
+    Retorna el número de vínculos eliminados.
+    """
+    # Primero obtenemos los IDs de los fragmentos del capítulo
+    frag_ids = [
+        fid for (fid,) in
+        db.query(Fragment.id).filter(Fragment.chapter_id == chapter_id).all()
+    ]
+    if not frag_ids:
+        return 0
+
+    # Borramos los vínculos que apunten a esos fragmentos
+    deleted = (
+        db.query(EntityFragment)
+        .filter(EntityFragment.fragment_id.in_(frag_ids))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return deleted
+
+
+def get_entities_by_chapter(db: Session, chapter_id: int) -> list[dict]:
+    """
+    Devuelve las entidades que aparecen en fragmentos del capítulo dado,
+    junto con la lista de fragment_ids donde aparecen.
+
+    Returns list of dicts:
+        [{id, name, entity_type, description, project_id, fragment_ids: [int]}]
+    """
+    # Fragmentos del capítulo
+    frag_ids = [
+        fid for (fid,) in
+        db.query(Fragment.id).filter(Fragment.chapter_id == chapter_id).all()
+    ]
+    if not frag_ids:
+        return []
+
+    # EntityFragments para esos fragmentos
+    links = (
+        db.query(EntityFragment)
+        .filter(EntityFragment.fragment_id.in_(frag_ids))
+        .all()
+    )
+
+    # Agrupar por entity_id
+    entity_frag_map: dict[int, list[int]] = {}
+    entity_aliases_map: dict[int, set[str]] = {}
+    entity_ids = set()
+    for link in links:
+        entity_ids.add(link.entity_id)
+        entity_frag_map.setdefault(link.entity_id, []).append(link.fragment_id)
+        if link.alias_in_text:
+            entity_aliases_map.setdefault(link.entity_id, set()).add(link.alias_in_text)
+
+    if not entity_ids:
+        return []
+
+    # Cargar entidades
+    entities = db.query(Entity).filter(Entity.id.in_(entity_ids)).all()
+
+    result = []
+    for e in entities:
+        # Añadir el nombre base también a los alias por defecto para asegurar que se resalta
+        aliases = entity_aliases_map.get(e.id, set())
+        aliases.add(e.name)
+        
+        result.append({
+            "id": e.id,
+            "name": e.name,
+            "entity_type": e.entity_type,
+            "description": e.description,
+            "project_id": e.project_id,
+            "fragment_ids": sorted(list(set(entity_frag_map.get(e.id, [])))),
+            "aliases": sorted(list(aliases))
+        })
+
+    return sorted(result, key=lambda x: x["name"])
+
+
+def get_entities_by_novel(db: Session, novel_id: int) -> list[dict]:
+    """
+    Devuelve las entidades que aparecen en todos los fragmentos de la novela dada,
+    junto con la lista de fragmentos y su contenido donde aparecen.
+
+    Returns list of dicts:
+        [{id, name, entity_type, description, project_id, fragments: [{id, content, chapter_id}]}]
+    """
+    # 1. Get all chapter IDs for the novel
+    chapter_ids = [
+        cid for (cid,) in
+        db.query(NovelChapter.id).filter(NovelChapter.novel_id == novel_id).all()
+    ]
+    if not chapter_ids:
+        return []
+
+    # 2. Get all fragments for these chapters
+    fragments = db.query(Fragment).filter(Fragment.chapter_id.in_(chapter_ids)).all()
+    if not fragments:
+        return []
+    
+    frag_map = {f.id: {"id": f.id, "content": f.content, "chapter_id": f.chapter_id} for f in fragments}
+    frag_ids = list(frag_map.keys())
+
+    # 3. Get EntityFragments for those fragments
+    links = (
+        db.query(EntityFragment)
+        .filter(EntityFragment.fragment_id.in_(frag_ids))
+        .all()
+    )
+
+    # Agrupar por entity_id
+    entity_frag_map: dict[int, set[int]] = {}
+    entity_aliases_map: dict[int, set[str]] = {}
+    entity_ids = set()
+    for link in links:
+        entity_ids.add(link.entity_id)
+        entity_frag_map.setdefault(link.entity_id, set()).add(link.fragment_id)
+        if link.alias_in_text:
+            entity_aliases_map.setdefault(link.entity_id, set()).add(link.alias_in_text)
+
+    if not entity_ids:
+        return []
+
+    # Cargar entidades
+    entities = db.query(Entity).filter(Entity.id.in_(entity_ids)).all()
+
+    result = []
+    for e in entities:
+        aliases = entity_aliases_map.get(e.id, set())
+        aliases.add(e.name)
+        
+        # Get fragment objects
+        e_frag_ids = entity_frag_map.get(e.id, set())
+        e_fragments = [frag_map[fid] for fid in e_frag_ids if fid in frag_map]
+        
+        # Sort fragments by chapter_id then fragment id to keep narrative order
+        e_fragments.sort(key=lambda x: (x["chapter_id"], x["id"]))
+
+        result.append({
+            "id": e.id,
+            "name": e.name,
+            "entity_type": e.entity_type,
+            "description": e.description,
+            "project_id": e.project_id,
+            "fragments": e_fragments,
+            "aliases": sorted(list(aliases))
+        })
+
+    return sorted(result, key=lambda x: x["name"])

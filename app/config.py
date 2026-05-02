@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    database_url: str = "sqlite:///./novel_analyzer.db"
+    database_url: str = "sqlite:///./db.sqlite"
     app_name: str = "Novel Analyzer API"
     app_version: str = "0.1.0"
     debug: bool = True

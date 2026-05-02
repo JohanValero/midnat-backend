@@ -4,11 +4,17 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.schemas import (
     FragmentCreate, FragmentInsertBetween,
-    FragmentResponse, FragmentUpdate,
+    FragmentResponse, FragmentUpdate, FragmentBulkSync
 )
 from app.services import fragment_service
 
 router = APIRouter(prefix="/fragments", tags=["Fragments"])
+
+@router.post("/bulk-sync", response_model=list[FragmentResponse], status_code=status.HTTP_200_OK)
+def bulk_sync_fragments(data: FragmentBulkSync, db: Session = Depends(get_db)):
+    """Reemplaza/actualiza todos los fragmentos del capítulo según la lista de bloques HTML enviados."""
+    return fragment_service.bulk_sync_fragments(db, data.chapter_id, data.blocks)
+
 
 
 @router.get("/by-chapter/{chapter_id}", response_model=list[FragmentResponse])
