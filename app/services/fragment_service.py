@@ -78,6 +78,8 @@ def create_fragment(db: Session, data: FragmentCreate) -> Fragment:
         **payload,
         content_hash=_hash(payload["content"]),
         order=order,
+        entities_dirty=True,
+        scenes_dirty=True,
     )
     db.add(fragment)
     db.commit()
@@ -110,6 +112,8 @@ def insert_fragment_between(db: Session, data: FragmentInsertBetween) -> Fragmen
         **payload,
         content_hash=_hash(payload["content"]),
         order=mid,
+        entities_dirty=True,
+        scenes_dirty=True,
     )
     db.add(fragment)
     db.commit()
@@ -124,9 +128,11 @@ def update_fragment(db: Session, fragment_id: int, data: FragmentUpdate) -> Frag
 
     updates = data.model_dump(exclude_unset=True)
 
-    # Si el contenido cambia, invalidamos el hash anterior
+    # Si el contenido cambia, invalidamos el hash anterior y marcamos como sucio para LLM
     if "content" in updates:
         updates["content_hash"] = _hash(updates["content"])
+        updates["entities_dirty"] = True
+        updates["scenes_dirty"] = True
 
     for field, value in updates.items():
         setattr(fragment, field, value)
@@ -170,6 +176,8 @@ def bulk_sync_fragments(db: Session, chapter_id: int, blocks: list[str]) -> list
                 if frag.content != new_content or frag.content_hash != new_hash:
                     frag.content = new_content
                     frag.content_hash = new_hash
+                    frag.entities_dirty = True
+                    frag.scenes_dirty = True
                 final_sequence.append(frag)
                 
             if (i2 - i1) > common_len:
@@ -210,7 +218,9 @@ def bulk_sync_fragments(db: Session, chapter_id: int, blocks: list[str]) -> list
                         chapter_id=chapter_id,
                         content=seq[start+k],
                         content_hash=_hash(seq[start+k]),
-                        order=order
+                        order=order,
+                        entities_dirty=True,
+                        scenes_dirty=True,
                     )
                     db.add(new_frag)
                     seq[start+k] = new_frag

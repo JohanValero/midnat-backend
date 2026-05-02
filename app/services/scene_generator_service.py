@@ -21,11 +21,12 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.models import Fragment, Scene
+from app.config import settings
 from app.services import scene_service, fragment_service, llm_service
 
 log = logging.getLogger("scene_generator")
 
-LLAMA_URL = "http://localhost:8081"
+LLAMA_URL = settings.llama_url
 TEMPERATURE = 0.1
 MAX_TOKENS = 8512
 MAX_RETRIES = 3
@@ -327,6 +328,10 @@ async def generate_scenes_stream(chapter_id: int, db: Session) -> AsyncGenerator
         yield _sse({"type": "text",
                     "token": f"Escena {i + 1}: \"{scene.title}\" ({frag_count} frags, ~{word_count} palabras)\n"})
 
+    db.commit()
+
+    # Limpiar flag de scenes_dirty para todos los fragmentos del capítulo
+    db.query(Fragment).filter(Fragment.chapter_id == chapter_id).update({"scenes_dirty": False})
     db.commit()
 
     yield _sse({"type": "status", "step": "complete",

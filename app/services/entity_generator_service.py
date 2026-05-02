@@ -19,11 +19,12 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.models import Fragment, Entity, EntityFragment, NovelChapter, Novel
+from app.config import settings
 from app.services import entity_service, fragment_service, llm_service
 
 log = logging.getLogger("entity_generator")
 
-LLAMA_URL = "http://localhost:8081"
+LLAMA_URL = settings.llama_url
 TEMPERATURE = 0.1
 MAX_TOKENS = 8512
 MAX_RETRIES = 3
@@ -319,6 +320,10 @@ async def generate_entities_stream(chapter_id: int, db: Session) -> AsyncGenerat
 
             yield _sse({"type": "text", "token": f"{entity.name}: {text.strip()[:120]}\n"})
             break
+
+    # Limpiar flag de entities_dirty para todos los fragmentos del capítulo
+    db.query(Fragment).filter(Fragment.chapter_id == chapter_id).update({"entities_dirty": False})
+    db.commit()
 
     yield _sse({"type": "status", "step": "complete", "message": f"Done. {total_entities} entities processed."})
     yield _sse({"type": "entities_ready", "count": total_entities})

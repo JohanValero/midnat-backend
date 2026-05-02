@@ -7,8 +7,7 @@ from app.config import settings
 
 log = logging.getLogger("llm_service")
 
-# Usually localhost:8081 for the user's Gemma 4 model
-LLAMA_URL = "http://localhost:8081"
+LLAMA_URL = settings.llama_url
 TEMPERATURE = 0.1
 MAX_TOKENS = 8192
 

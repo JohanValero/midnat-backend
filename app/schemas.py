@@ -192,6 +192,8 @@ class FragmentResponse(FragmentBase):
     chapter_id: int
     content_hash: str
     order: int
+    entities_dirty: bool
+    scenes_dirty: bool
     created_at: datetime
     updated_at: datetime
     model_config = ConfigDict(from_attributes=True)

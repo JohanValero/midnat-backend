@@ -19,7 +19,7 @@ SQLite no soporta ALTER TABLE ADD CONSTRAINT, por lo que la opción
 """
 from sqlalchemy import (
     Column, ForeignKey, Integer, JSON, String, Text,
-    DateTime, UniqueConstraint,
+    DateTime, UniqueConstraint, Boolean,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -188,6 +188,9 @@ class Fragment(Base):
     order = Column(Integer, nullable=False)
     # JSON flexible: anotaciones del LLM, entidades extraídas, tipo de fragmento, etc.
     fragment_metadata = Column(JSON, nullable=True)
+    # Flags de sincronización con LLM
+    entities_dirty = Column(Boolean, default=False, nullable=False)
+    scenes_dirty = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(),
                         onupdate=func.now())
