@@ -7,7 +7,7 @@ from app.schemas import (
     ChapterCreate, ChapterHistoryResponse, ChapterResponse,
     ChapterUpdate, PublishChapterRequest,
 )
-from app.services import chapter_service, fragment_service, llm_service, scene_generator_service, entity_generator_service, entity_service
+from app.services import chapter_service, fragment_service, llm_service, scene_generator_service, entity_generator_service, entity_service, export_service
 
 router = APIRouter(prefix="/chapters", tags=["Chapters"])
 
@@ -91,6 +91,22 @@ def update_chapter(chapter_id: int, data: ChapterUpdate, db: Session = Depends(g
 def delete_chapter(chapter_id: int, db: Session = Depends(get_db)):
     if not chapter_service.delete_chapter(db, chapter_id):
         raise HTTPException(status_code=404, detail="Chapter not found")
+
+
+@router.get("/{chapter_id}/export/{format}")
+def export_chapter(chapter_id: int, format: str, db: Session = Depends(get_db)):
+    """Exporta un capítulo en Markdown, docx o PDF."""
+    try:
+        file_stream, filename, media_type = export_service.export_chapter(db, chapter_id, format)
+        return StreamingResponse(
+            file_stream,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Publicación ───────────────────────────────────────────────────────────────

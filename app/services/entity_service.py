@@ -270,7 +270,7 @@ def get_entities_by_novel(db: Session, novel_id: int) -> list[dict]:
     if not fragments:
         return []
     
-    frag_map = {f.id: {"id": f.id, "content": f.content, "chapter_id": f.chapter_id} for f in fragments}
+    frag_map = {f.id: {"id": f.id, "content": f.content, "chapter_id": f.chapter_id, "order": f.order} for f in fragments}
     frag_ids = list(frag_map.keys())
 
     # 3. Get EntityFragments for those fragments
@@ -305,8 +305,8 @@ def get_entities_by_novel(db: Session, novel_id: int) -> list[dict]:
         e_frag_ids = entity_frag_map.get(e.id, set())
         e_fragments = [frag_map[fid] for fid in e_frag_ids if fid in frag_map]
         
-        # Sort fragments by chapter_id then fragment id to keep narrative order
-        e_fragments.sort(key=lambda x: (x["chapter_id"], x["id"]))
+        # Sort fragments by chapter_id then order to keep narrative order
+        e_fragments.sort(key=lambda x: (x["chapter_id"], x["order"]))
 
         result.append({
             "id": e.id,

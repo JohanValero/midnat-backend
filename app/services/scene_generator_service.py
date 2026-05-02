@@ -32,13 +32,19 @@ MAX_TOKENS = 8512
 MAX_RETRIES = 3
 
 SYSTEM_SCENES = """\
-Eres un analizador de estructura narrativa experto. Tu tarea es leer el capítulo completo y dividirlo en sus escenas naturales.
+Eres un analizador de estructura narrativa experto. Tu tarea es leer el capítulo completo y dividirlo en ESCENAS LARGAS E IMPORTANTES.
+Evita fragmentar la narrativa en demasiadas escenas pequeñas; buscamos bloques narrativos significativos que mantengan la continuidad dramática y el peso emocional.
 
-Un cambio de escena ocurre cuando hay:
-- Cambio de ubicación/escenario
-- Salto temporal significativo
-- Cambio drástico de personajes presentes
-- Transición narrativa clara (separador, cambio de perspectiva)
+Un cambio de escena SOLAMENTE ocurre cuando hay una ruptura clara en la continuidad situacional:
+- Cambio físico de ubicación (ej. de una oficina a un bosque).
+- Salto temporal significativo (ej. "al día siguiente", "semanas después").
+- Cambio total o casi total de los personajes presentes.
+- Un cambio drástico en la perspectiva narrativa o el tono que actúe como un corte cinematográfico.
+
+IMPORTANTE SOBRE LA CONTINUIDAD:
+- Si la "cámara" narrativa fluye sin cortes, mantén la escena unida aunque la acción evolucione.
+- Ejemplo: Si un personaje está realizando un stream y de repente ocurre un terremoto en el mismo lugar, eso es UNA SOLA ESCENA continua. No dividas escenas solo porque la acción cambie o el conflicto escale; divídelas solo cuando el contexto situacional cambie por completo.
+- Se prefieren escenas extensas y cohesionadas sobre múltiples fragmentos cortos de acción.
 
 Para cada escena identificada, proporciona:
 - "title": título corto de la escena (máx. 8 palabras)
@@ -46,18 +52,18 @@ Para cada escena identificada, proporciona:
 - "start_text": copia textual las primeras 15-25 palabras del fragmento donde INICIA la escena (esto se usará para localizar la escena en el texto)
 - "key_points": lista de 3-5 puntos clave breves
 
-IMPORTANTE:
+REGLAS DE FORMATO:
 - La primera escena siempre inicia al comienzo del capítulo.
-- El "start_text" debe ser una COPIA EXACTA del texto original, no una paráfrasis.
-- No inventes texto que no esté en el capítulo.
+- El "start_text" debe ser una COPIA EXACTA del texto original.
+- Responde ÚNICAMENTE con un JSON array válido.
 
-Responde ÚNICAMENTE con un JSON array válido. Ejemplo:
+Ejemplo:
 [
   {
-    "title": "Despertar en la cabaña",
-    "description": "El protagonista despierta en una cabaña abandonada...",
-    "start_text": "La luz del amanecer se filtraba por las rendijas de la ventana rota",
-    "key_points": ["Despertar confuso", "Cabaña abandonada", "Herida en el brazo"]
+    "title": "El stream interrumpido",
+    "description": "Alex presenta su canal a los seguidores cuando un terremoto violento sacude el edificio, forzándolo a buscar refugio bajo el escritorio.",
+    "start_text": "Bienvenidos de nuevo a mi canal hoy vamos a hablar de algo especial",
+    "key_points": ["Presentación del personaje", "Inicio del sismo", "Lucha por la supervivencia"]
   }
 ]
 

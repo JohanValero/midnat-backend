@@ -275,6 +275,7 @@ class NovelEntityFragment(BaseModel):
     id: int
     content: str
     chapter_id: int
+    order: int
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -295,6 +296,7 @@ class ChapterEntityFragment(BaseModel):
     id: int
     content: str
     chapter_id: int
+    order: int
     model_config = ConfigDict(from_attributes=True)
 
 

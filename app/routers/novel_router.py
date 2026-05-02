@@ -7,7 +7,7 @@ from app.schemas import (
     NovelCreate, NovelResponse, NovelUpdate,
     NovelEntityDetailResponse, NovelEntitySummaryResponse,
 )
-from app.services import novel_service, novel_entity_service
+from app.services import novel_service, novel_entity_service, export_service
 
 
 router: APIRouter = APIRouter(prefix="/novels", tags=["Novels"])
@@ -51,6 +51,22 @@ def update_novel(novel_id: int, data: NovelUpdate, db: Session = Depends(get_db)
 def delete_novel(novel_id: int, db: Session = Depends(get_db)):
     if not novel_service.delete_novel(db, novel_id):
         raise HTTPException(status_code=404, detail="Novel not found")
+
+
+@router.get("/{novel_id}/export/{format}")
+def export_novel(novel_id: int, format: str, db: Session = Depends(get_db)):
+    """Exporta la novela completa en Markdown, docx o PDF."""
+    try:
+        file_stream, filename, media_type = export_service.export_novel(db, novel_id, format)
+        return StreamingResponse(
+            file_stream,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Novel Entities (entidades canónicas consolidadas) ─────────────────────────

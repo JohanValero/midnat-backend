@@ -5,3 +5,8 @@ pydantic
 pydantic-settings
 python-dotenv
 httpx
+python-docx
+markdown
+xhtml2pdf
+html2text
+beautifulsoup4
