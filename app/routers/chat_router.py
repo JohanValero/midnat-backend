@@ -51,7 +51,7 @@ def _build_context(db: Session, novel_id: int, chapter_ids: list[int]) -> str:
     for ch in sorted(chapters, key=lambda c: c.chapter_number):
         frags = fragment_service.get_fragments_by_chapter(db, ch.id)
         frags_sorted = sorted(frags, key=lambda f: f.order)
-        text = "\n\n".join(_strip_html(f.content) for f in frags_sorted if f.content)
+        text = "\n\n".join(f"[F:{f.id}] {_strip_html(f.content)}" for f in frags_sorted if f.content)
         if text.strip():
             parts.append(f"--- Capítulo {ch.chapter_number}: {ch.title} ---\n{text}")
 
