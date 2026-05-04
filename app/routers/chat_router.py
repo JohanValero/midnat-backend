@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.schemas import ChatRequest
+from app.schemas import ChatRequest, PlanRequest, ExecuteStepRequest
 from app.services import (
     chapter_service,
     fragment_service,
@@ -74,6 +74,48 @@ async def chat(data: ChatRequest, db: Session = Depends(get_db)):
 
     return StreamingResponse(
         llm_service.generate_chat_response_stream(data.prompt, context, history),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/plan")
+async def generate_plan_endpoint(data: PlanRequest, db: Session = Depends(get_db)):
+    """Genera un plan multi-paso para una tarea compleja (modo planificado)."""
+    novel = novel_service.get_novel(db, data.novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail="Novel not found")
+
+    context = _build_context(db, data.novel_id, data.chapter_ids)
+
+    try:
+        plan = await llm_service.generate_plan(data.prompt, context)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating plan: {e}")
+
+    return plan
+
+
+@router.post("/execute-step")
+async def execute_step_endpoint(data: ExecuteStepRequest, db: Session = Depends(get_db)):
+    """Ejecuta un paso individual de un plan con streaming SSE."""
+    novel = novel_service.get_novel(db, data.novel_id)
+    if not novel:
+        raise HTTPException(status_code=404, detail="Novel not found")
+
+    context = _build_context(db, data.novel_id, data.chapter_ids)
+    prev = [{"title": r.title, "summary": r.summary} for r in data.previous_results]
+
+    return StreamingResponse(
+        llm_service.execute_plan_step_stream(
+            step_prompt=data.step_prompt,
+            step_title=data.step_title,
+            objective=data.objective,
+            context_text=context,
+            previous_results=prev,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

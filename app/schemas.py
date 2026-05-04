@@ -360,7 +360,7 @@ class EntityRelationResponse(EntityRelationBase):
 
 class ChatMessageItem(BaseModel):
     """Un mensaje en el historial de conversación."""
-    role: str = Field(..., pattern=r"^(user|assistant)$")
+    role: str = Field(..., pattern=r"^(user|assistant|ai)$")
     content: str
 
 
@@ -376,3 +376,43 @@ class ChatRequest(BaseModel):
         default=[],
         description="Historial previo de la conversación.",
     )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Planning Mode (Multi-step planned chat)
+# ═══════════════════════════════════════════════════════════════════
+
+class PlanStepSchema(BaseModel):
+    """Un paso individual de un plan."""
+    title: str
+    description: str
+    prompt: str
+
+
+class GeneratedPlan(BaseModel):
+    """Respuesta del endpoint /chat/plan."""
+    objective: str
+    steps: list[PlanStepSchema]
+
+
+class PlanRequest(BaseModel):
+    """Petición para generar un plan multi-paso."""
+    prompt: str = Field(..., min_length=1)
+    novel_id: int
+    chapter_ids: list[int] = Field(default=[])
+
+
+class PreviousStepSummary(BaseModel):
+    """Resumen de un paso previo para alimentar al paso actual."""
+    title: str
+    summary: str
+
+
+class ExecuteStepRequest(BaseModel):
+    """Petición para ejecutar un paso individual de un plan."""
+    step_prompt: str = Field(..., min_length=1)
+    step_title: str
+    objective: str
+    novel_id: int
+    chapter_ids: list[int] = Field(default=[])
+    previous_results: list[PreviousStepSummary] = Field(default=[])
